@@ -1,89 +1,43 @@
 # 实验指令队列（客户端 AI → KimiCode）
 
 > 本文件由客户端 AI 维护，每次巡检看板后更新。
-> KimiCode 执行规则：每批实验完成后拉取本文件最新版，按"当前指令"执行；执行中严格遵守既有约束（评估代码不动；数据集只读；协议原版 lr=5e-4/PolyLR/50ep/bs=4/seed=42；峰值口径判据：max mIoU > 锚点 且 ODS ≥ 锚点 − 0.005 即正向收益）。
 > **拉取频率：每小时一次。**
 
-**更新时间**：2026-10-23（第 13 次下发，插入 S1）
-**状态**：X6 排队 → **S1（新增）** → FINAL_CAP（以最强形态收官）
+**更新时间**：2026-10-23（第 14 次下发，⚠️ 评测协议统一纠偏，最高优先级）
+**状态**：FINAL_CAP_S1 跑完后，立即执行本批纠偏流程
 
 ---
 
-## 已确认结论（勿重复验证）
+## ⚠️ 主人裁决（最高优先级，立即生效）
 
-- 重排路线证伪（F 系列、X1/X3）；H-A 成立：加权替代重排；当前最优 **G2 = K8 蛇形 + DAWF（0.8785/0.9101）**；
-- X4/X5 证伪"化繁为简"：蛇形局部连续性不可替代（同 8 方向下蛇形比直线 +0.0054）。
+**两条线评测协议必须统一，统一标准为 SCSegamba 原版协议**：
+- 逐 epoch 直接在**测试集**上评测，取 50 轮 max mIoU（与老线 M/V6/A 系列口径一致）；
+- 指标用 SCSegamba 原版评测代码的 ODS/OIS/F1（不是 F1@0.5）；
+- v6final 线此前的"val 选模 + test 一次 + F1@0.5"口径作废，仅留档备查。
 
----
+**关键事实（执行前必读）**：训练权重与评测协议无关——所有已跑 run 的模型不需要重训，只需用 SCSegamba 口径**回放评测**。
 
-## 队列
+## 纠偏流程（按顺序）
 
-### X6（排队中，不变）：uni4 + DAWF
-四朝向单扫，补齐 2×2 矩阵。完成即登记。
+### Step 0：checkpoint 盘点（立即，零成本）
+检查 F0/F1/F3/F4/F5/G1/G2/G3/X1~X6/S1/FINAL_CAP_S1 各 run 是否保存了**逐 epoch checkpoint**（而非仅 best-val ckpt），在看板/results_log 公布清单。这决定走 Step 1 还是 Step 2。
 
-### 本次新增：S1 = G2 配置 + 多尺度平滑 Hessian 打分（插在 X6 之后、FINAL_CAP 之前）
+### Step 1（有逐 epoch ckpt 的 run）：回放评测
+对每个 run 的 50 个 epoch ckpt，用 SCSegamba 原版评测代码逐轮测 **test 集**，登记：max mIoU / best_ep(test) / ODS / OIS / F1 / 后10轮均值。**不改动任何训练产物，只读 ckpt。** 全部结果以新表"统一口径（SCSegamba 协议）"登记在看板，旧口径行保留但标注"作废口径"。
 
-**动机（供理解勿改）**：G2 的 DAWF 打分来自无平滑 3×3 单尺度差分，噪声大；verify_hessian 已实测多尺度平滑 vesselness 的裂缝/背景对比度 9.83 倍。打分 s_k(p) 是对齐度的含噪估计，softmax 对噪声敏感——降噪即提质。**零新增参数**（打分在 @torch.no_grad 下）。
+### Step 2（无逐 epoch ckpt 的 run）：按优先级补训
+修改 v6final 训练脚本评测段：每 epoch 用 SCSegamba 原版评测直接测 test 集并保存 ckpt。补训优先级：
+1. **S1**（最终方案，必须有）
+2. **F0**（基座锚点）
+3. **G2**（DAWF 关键对照）
+4. X2 / X5 / X6（矩阵代表格）
+5. G1 / G3 / X1 / X3 / X4 / F3 / F4（矩阵其余格，按序补齐）
 
-**配置**：ATS_SCAN=serpentine（K8 默认）+ ATS_FUSE=dawf + ATS_REORDER=none + **ATS_SCORE=ms**。
-
-**代码改动（SAVSS_2D_v6_v4.py，新增 env 开关 + 替换 _hessian_analysis 内部实现）**：
-
-```python
-# 文件头 env 区新增：
-ATS_SCORE = os.environ.get('ATS_SCORE', 'ss')   # ss=单尺度(现状默认) | ms=多尺度
-assert ATS_SCORE in ('ss', 'ms')
-
-# __init__ 新增：可分离高斯核缓存
-self._gauss_cache = {}
-
-def _gaussian_blur(self, img, sigma):
-    """img: (B,1,H,W)。可分离高斯平滑，σ∈{1,2,4}。"""
-    if sigma not in self._gauss_cache:
-        r = max(1, int(3 * sigma))
-        x = torch.arange(-r, r + 1, dtype=torch.float32, device=img.device)
-        g = torch.exp(-x * x / (2 * sigma * sigma)); g = g / g.sum()
-        self._gauss_cache[sigma] = (g, r)
-    g, r = self._gauss_cache[sigma]
-    img = F.conv2d(img, g.view(1, 1, 1, -1), padding=(0, r))
-    img = F.conv2d(img, g.view(1, 1, -1, 1), padding=(r, 0))
-    return img
-
-def _hessian_analysis(self, x_2d):
-    """ms 模式：σ∈{1,2,4} 逐尺度计算 crackness/angle，crackness 取跨尺度 max，
-    angle 取 argmax 尺度对应值（gather）。"""
-    F_mean = x_2d.mean(dim=1, keepdim=True)                     # (B,1,H,W)
-    if ATS_SCORE == 'ss':
-        blurred = [F_mean]
-    else:
-        blurred = [self._gaussian_blur(F_mean, s) for s in (1.0, 2.0, 4.0)]
-    cs, as_ = [], []
-    for b in blurred:
-        Fxx = F.conv2d(b, self.K_xx, padding=1)
-        Fyy = F.conv2d(b, self.K_yy, padding=1)
-        Fxy = F.conv2d(b, self.K_xy, padding=1)
-        th, dh = (Fxx + Fyy) / 2.0, (Fxx - Fyy) / 2.0
-        disc = torch.sqrt(dh * dh + Fxy * Fxy + 1e-8)
-        a1 = (th + disc).abs(); a2 = (th - disc).abs()
-        c = ((a1 - a2) / (a1 + a2 + 1e-8)).clamp(0., 1.)
-        a = (0.5 * torch.atan2(2.0 * Fxy, Fxx - Fyy + 1e-8) + math.pi / 2.0) % math.pi
-        cs.append(c); as_.append(a)
-    if ATS_SCORE == 'ss':
-        return cs[0].squeeze(1), as_[0].squeeze(1)
-    cstack = torch.stack(cs, dim=1)                             # (B,S,1,H,W)
-    cmax, amax = cstack.max(dim=1)                              # (B,1,H,W)
-    astack = torch.stack(as_, dim=1)
-    angle = astack.gather(1, amax.unsqueeze(1)).squeeze(1)      # (B,1,H,W)
-    return cmax.squeeze(1), angle.squeeze(1)
-```
-
-**判据**：锚点 G2（0.8785/0.9101）：max mIoU > 0.8785 且 ODS ≥ 0.9051 → 正向；登记 β 收敛值（预期比 G2 更大——打分降噪后方向选择应更自信，写进 results_log 作论文证据）。S1 未过判据不影响 FINAL_CAP 执行（FINAL_CAP 以届时全场最优为基座）。
-
-### FINAL_CAP（条件 run，不变）：X/G/S 全场 max mIoU 最优者 + EMA(0.999)
-S1 过判据则 FINAL_CAP = S1+EMA；否则 = G2+EMA。完成后更新看板并停止，等客户端收口指令。
+### Step 3：FINAL_CAP_S1 处理
+当前在跑的 FINAL_CAP_S1 让它跑完（数据留档），随后同样走 Step 1/2 出统一口径数字。**不再启动任何新训练，直到统一口径表完成。**
 
 ### 明确不做的
-- Δ 调制不跑；3 seed 复核不做；数据集图像内容一个字节都不许改。
+- 不再用 val-select 口径报任何新数字；数据集图像内容一个字节都不许改。
 
 ### 上报
-- 每个 run 完成后更新看板 + results_log.md；队列跑空后每小时拉取一次本文件等待指令
+- Step 0 盘点结果**立即**上看板（不用等跑完）；每个 run 回放/补训完成即更新；全部完成后等客户端收口指令

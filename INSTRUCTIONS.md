@@ -4,62 +4,83 @@
 > KimiCode 执行规则：每批实验完成后拉取本文件最新版，按"当前指令"执行；执行中严格遵守既有约束（评估代码不动；数据集只读；协议原版 lr=5e-4/PolyLR/50ep/bs=4/seed=42；峰值口径判据：max mIoU > 锚点 且 ODS ≥ 锚点 − 0.005 即正向收益）。
 > **拉取频率：每小时一次。**
 
-**更新时间**：2026-10-23（第 12 次下发，追加 X6-uni4）
-**状态**：X1 训练中 → X3 → X4 → X5 → **X6（新增）** → FINAL_CAP
+**更新时间**：2026-10-23（第 13 次下发，插入 S1）
+**状态**：X6 排队 → **S1（新增）** → FINAL_CAP（以最强形态收官）
 
 ---
 
 ## 已确认结论（勿重复验证）
 
-- 重排路线证伪（F 系列）；**H-A 成立：加权替代重排**（G 系列）；DAWF-G2（0.8785/0.9101）为当前最优；
-- X2（cross4+DAWF）0.8753/0.9140 ✗——cross4 为 0°/90° 两轴双向，缺对角朝向。
+- 重排路线证伪（F 系列、X1/X3）；H-A 成立：加权替代重排；当前最优 **G2 = K8 蛇形 + DAWF（0.8785/0.9101）**；
+- X4/X5 证伪"化繁为简"：蛇形局部连续性不可替代（同 8 方向下蛇形比直线 +0.0054）。
 
 ---
 
-## 队列：X 系列（化繁为简平行扫描 × 动态机制）
+## 队列
 
-### 已完成/在跑（不变）
-X2 ✅ → X1 🔄 → X3 排队 → X4（diag4+dawf）排队 → X5（straight8+dawf）排队
+### X6（排队中，不变）：uni4 + DAWF
+四朝向单扫，补齐 2×2 矩阵。完成即登记。
 
-### 本次新增：X6 = uni4 + DAWF（主人原始意图：四朝向并行单扫）
+### 本次新增：S1 = G2 配置 + 多尺度平滑 Hessian 打分（插在 X6 之后、FINAL_CAP 之前）
 
-**语义**：0°、90°、45°、135° 四个朝向各扫一次（单向），K=4。检验"K=4 预算下方向覆盖 vs 双向性孰重要"，且 DAWF 四路权重互不相同（区别于 cross4 的两族竞争）。
+**动机（供理解勿改）**：G2 的 DAWF 打分来自无平滑 3×3 单尺度差分，噪声大；verify_hessian 已实测多尺度平滑 vesselness 的裂缝/背景对比度 9.83 倍。打分 s_k(p) 是对齐度的含噪估计，softmax 对噪声敏感——降噪即提质。**零新增参数**（打分在 @torch.no_grad 下）。
 
-**代码改动（SAVSS_2D_v6_v4.py，改动 1~3 若已完成则跳过；本次为改动 4）**：
+**配置**：ATS_SCAN=serpentine（K8 默认）+ ATS_FUSE=dawf + ATS_REORDER=none + **ATS_SCORE=ms**。
+
+**代码改动（SAVSS_2D_v6_v4.py，新增 env 开关 + 替换 _hessian_analysis 内部实现）**：
 
 ```python
-# assert 行追加 'uni4'：
-assert ATS_SCAN in ('serpentine','rowmajor','bidi','cross4','diag4','straight8','uni4')
+# 文件头 env 区新增：
+ATS_SCORE = os.environ.get('ATS_SCORE', 'ss')   # ss=单尺度(现状默认) | ms=多尺度
+assert ATS_SCORE in ('ss', 'ms')
 
-# K 分支：uni4 归入 K=4
-elif self.scan_mode in ('cross4', 'diag4', 'uni4'): self.K = 4
+# __init__ 新增：可分离高斯核缓存
+self._gauss_cache = {}
 
-# path_angles 新增一支（注意：四路各不相同，顺序与 orders 严格对应）：
-elif self.scan_mode == 'uni4':
-    path_angles = [0.0, math.pi/2, math.pi/4, 3*math.pi/4]
+def _gaussian_blur(self, img, sigma):
+    """img: (B,1,H,W)。可分离高斯平滑，σ∈{1,2,4}。"""
+    if sigma not in self._gauss_cache:
+        r = max(1, int(3 * sigma))
+        x = torch.arange(-r, r + 1, dtype=torch.float32, device=img.device)
+        g = torch.exp(-x * x / (2 * sigma * sigma)); g = g / g.sum()
+        self._gauss_cache[sigma] = (g, r)
+    g, r = self._gauss_cache[sigma]
+    img = F.conv2d(img, g.view(1, 1, 1, -1), padding=(0, r))
+    img = F.conv2d(img, g.view(1, 1, -1, 1), padding=(r, 0))
+    return img
 
-# _get_base_orders 新增一支（全部复用现成原语，禁止新写几何函数）：
-elif self.scan_mode == 'uni4':
-    rm   = self._build_rowmajor(H, W)                      # 0°
-    cm   = self._build_colmajor(H, W)                      # 90°
-    d45  = self._build_rotated_serpentine(H, W, math.pi/4) # 45°
-    d135 = self._build_rotated_serpentine(H, W, 3*math.pi/4)
-    orders = [rm, cm, d45, d135]
+def _hessian_analysis(self, x_2d):
+    """ms 模式：σ∈{1,2,4} 逐尺度计算 crackness/angle，crackness 取跨尺度 max，
+    angle 取 argmax 尺度对应值（gather）。"""
+    F_mean = x_2d.mean(dim=1, keepdim=True)                     # (B,1,H,W)
+    if ATS_SCORE == 'ss':
+        blurred = [F_mean]
+    else:
+        blurred = [self._gaussian_blur(F_mean, s) for s in (1.0, 2.0, 4.0)]
+    cs, as_ = [], []
+    for b in blurred:
+        Fxx = F.conv2d(b, self.K_xx, padding=1)
+        Fyy = F.conv2d(b, self.K_yy, padding=1)
+        Fxy = F.conv2d(b, self.K_xy, padding=1)
+        th, dh = (Fxx + Fyy) / 2.0, (Fxx - Fyy) / 2.0
+        disc = torch.sqrt(dh * dh + Fxy * Fxy + 1e-8)
+        a1 = (th + disc).abs(); a2 = (th - disc).abs()
+        c = ((a1 - a2) / (a1 + a2 + 1e-8)).clamp(0., 1.)
+        a = (0.5 * torch.atan2(2.0 * Fxy, Fxx - Fyy + 1e-8) + math.pi / 2.0) % math.pi
+        cs.append(c); as_.append(a)
+    if ATS_SCORE == 'ss':
+        return cs[0].squeeze(1), as_[0].squeeze(1)
+    cstack = torch.stack(cs, dim=1)                             # (B,S,1,H,W)
+    cmax, amax = cstack.max(dim=1)                              # (B,1,H,W)
+    astack = torch.stack(as_, dim=1)
+    angle = astack.gather(1, amax.unsqueeze(1)).squeeze(1)      # (B,1,H,W)
+    return cmax.squeeze(1), angle.squeeze(1)
 ```
 
-### 更新后的执行矩阵（锚点 G2 = 0.8785/0.9101；超越线：max mIoU > 0.8785 且 ODS ≥ 0.9051）
+**判据**：锚点 G2（0.8785/0.9101）：max mIoU > 0.8785 且 ODS ≥ 0.9051 → 正向；登记 β 收敛值（预期比 G2 更大——打分降噪后方向选择应更自信，写进 results_log 作论文证据）。S1 未过判据不影响 FINAL_CAP 执行（FINAL_CAP 以届时全场最优为基座）。
 
-| 顺序 | run | 配置 | 状态 |
-|---|---|---|---|
-| 1 | X2 | cross4+dawf | ✅ 0.8753/0.9140 ✗ |
-| 2 | X1 | cross4+hessian 重排 | 🔄 |
-| 3 | X3 | cross4+重排+dawf | 排队 |
-| 4 | X4 | diag4+dawf | 排队 |
-| 5 | X5 | straight8+dawf | 排队 |
-| 6 | **X6** | **uni4+dawf**（ATS_SCAN=uni4, ATS_FUSE=dawf, ATS_REORDER=none） | **新增** |
-| 7（条件） | FINAL_CAP | 全场 max mIoU 最优者 + EMA(0.999) | 收官 |
-
-执行规则：按序执行；每 run 登记 max mIoU/ODS/F1/Params/GFLOPs/FPS/β 收敛值。FINAL_CAP 完成后更新看板并停止，等客户端收口指令。
+### FINAL_CAP（条件 run，不变）：X/G/S 全场 max mIoU 最优者 + EMA(0.999)
+S1 过判据则 FINAL_CAP = S1+EMA；否则 = G2+EMA。完成后更新看板并停止，等客户端收口指令。
 
 ### 明确不做的
 - Δ 调制不跑；3 seed 复核不做；数据集图像内容一个字节都不许改。

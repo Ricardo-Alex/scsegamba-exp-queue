@@ -3,56 +3,55 @@
 > 本文件由客户端 AI 维护，每次巡检看板后更新。
 > **拉取频率：每小时一次。**
 
-**更新时间**：2026-10-24（第 16 次下发：跨数据集泛化验证——DeepCrack / CRACK500 / Volker_DSC）
-**状态**：Z 系列已收官 → 执行第 16 批（论文泛化性对比表数据）
+**更新时间**：2026-10-24（第 17 次下发：主战场 REF 补跑 + 论文插图素材）
+**状态**：GEN 系列已收官 → 执行第 17 批（收官批，跑完实验部分全部结束）
 
 ---
 
 ## 已定稿（勿动）
 
 - **最终方案 = G2 配置**：K8 旋转蛇形 + DAWF（M_out 逐像素方向加权）+ 无重排 + 无 EMA；统一口径 0.8849/0.8612/0.9164；
-- **评测协议已统一为 SCSegamba 原版**（逐 epoch 测 test 取 max mIoU，ODS/OIS/F1 原版指标）——本批全部 run 必须走统一口径评测（第 14 批改好的评测段）。
+- **评测协议已统一为 SCSegamba 原版**（逐 epoch 测 test 取 max mIoU，ODS/OIS/F1 原版指标）；
+- GEN 系列 6/6 已收官（三集全负，如实留档），不再追加任何外部数据集实验。
 
 ---
 
-## 第 16 批：跨数据集泛化验证（GEN 系列）
+## 第 17 批：REF@UMTCV6 + 论文插图素材（收官批）
 
-### 目标
-用最终方案（G2 配置）在三个外部裂缝数据集上验证泛化性，并与 SCSegamba 原版（REF）同协议对比，产出论文"泛化性实验"对比表。**每个数据集必须跑 REF + G2 两个 run**，只跑 G2 没有基准列，数据不可用。
+### 任务 1（训练，唯一新增 run）：UMTCV6_REF
 
-### 数据集路径（先核实，截图中的路径有拼写误差）
+主战场缺 SCSegamba 原版的本地统一口径数——主结果表对比列必须补齐。
 
-- `autodl-tmp/SCSegamba-main/datasets/DeepCrack`
-- `autodl-tmp/SCSegamba-main/datasets/CRACK500`
-- `autodl-tmp/SCSegamba-main/datasets/Volker_DSC`
+| run | 数据集 | 配置 |
+|---|---|---|
+| UMTCV6_REF | UMTCV6（1920/240/240） | SCSegamba 原版（GEN 系列同款 REF 构建，含已授权的 DySample reshape 修复） |
 
-开跑前先 `ls` 核实三个目录的真实拼写与内部结构（train/val/test 划分、图像与标注格式、分辨率），上报客户端确认后再启动训练。**数据集目录严格只读**——任何预处理（resize/crop/格式转换）输出必须写到 datasets 目录之外，原文件一个字节都不许改。
+- 协议：冻结协议（AdamW lr=5e-4 / PolyLR / 50ep / bs=4 / seed=42 / 512×512），统一口径评测；
+- 50 个逐 epoch ckpt 全保留；
+- 完成后登记 max mIoU/ODS/OIS/F1/P/R/best_ep/后10均，与 G2（0.8849/0.8612/0.8642/0.9164）出对比行。
 
-### 实验矩阵（锚点 = 各数据集的 REF run）
+### 任务 2（推理可视化，不占多少 GPU）：DAWF 权重图 w_k(p)
 
-| 顺序 | run | 数据集 | 配置 |
-|---|---|---|---|
-| 1 | GEN_DC_REF | DeepCrack | SCSegamba 原版 |
-| 2 | GEN_DC_G2 | DeepCrack | **G2 最终配置**（K8 蛇形 + DAWF，无重排无 EMA） |
-| 3 | GEN_C500_REF | CRACK500 | SCSegamba 原版 |
-| 4 | GEN_C500_G2 | CRACK500 | G2 最终配置 |
-| 5 | GEN_VK_REF | Volker_DSC | SCSegamba 原版 |
-| 6 | GEN_VK_G2 | Volker_DSC | G2 最终配置 |
+用 G2 的 best ckpt 在 UMTCV6 test 集挑 4~6 张代表性巷道裂缝图（含斜向裂缝、交叉裂缝、弱对比度裂缝各至少 1 张），前向时 hook 导出 DAWF 的 8 路权重 w_k(p)（softmax(β·s) 之后、加权求和之前），产出：
 
-### 协议（公平性红线）
+- 每张图一组 9 宫格：原图+GT 叠加 | 8 个方向（0°/22.5°/…/157.5°）的 w_k(p) 热图（统一色标 viridis，标注各方向角度）；
+- 另出 1 张 argmax_k w_k(p) 方向归属图（8 色离散着色）——直观展示"权重方向与裂缝走向贴合"；
+- 存 results/thesis_figures/dawf_weights/，PNG 300dpi。
 
-- **每个数据集内部，REF 与 G2 必须使用完全相同的训练配置**：若 SCSegamba 仓库对该数据集有官方 per-dataset 配置（epoch 数 / 输入分辨率 / 增强策略），REF 和 G2 都用它；若无，则沿用冻结协议（AdamW lr=5e-4 / PolyLR / 50 epoch / bs=4 / seed=42）。
-- 评测走统一口径（逐 epoch test，max mIoU + 原版 ODS/OIS/F1）。
-- 判据照旧：G2 max mIoU > 同数据集 REF 且 ODS ≥ REF−0.005 记为正向；如实记录，不做任何挑选。
-- **每个 run 的全部 50 个 epoch checkpoint 必须保留**（不许再删，避免重演 replay-eval 补测）。
+### 任务 3（纯读 ckpt，零训练）：β 收敛曲线
+
+G2 保留的 50 个逐 epoch ckpt 中逐层读出 4 个 β 标量，画 β-epoch 折线图（4 层各一条线，标注终值 [0.305, 0.073, 0.287, 0.035] 及对应层深），存 results/thesis_figures/beta_curve.png。若逐 epoch ckpt 已被裁剪只剩 best+last，则如实上报"数据不足"，**不许重新训练**。
+
+### 任务 4（纯读日志，零训练）：Z1 vs G2 训练稳定性曲线
+
+从两 run 的 history/results JSON 取逐 epoch mIoU，画同图双折线（Z1 行主序 0.8801/后10均0.8701 vs G2 0.8849/后10均0.8838），标注各自后 10 轮均值水平线与峰均差，存 results/thesis_figures/stability_z1_vs_g2.png。
 
 ### 完成后
-6 个 run 全部完成后：更新看板 + results_log.md（含各 run 的 max mIoU/ODS/OIS/F1/后10均值/收敛 epoch），汇总为一张 3 数据集 × 2 模型的对比表，然后停止，等客户端收口指令。
+4 个任务全部完成（或如实上报阻塞）后：更新看板 + results_log.md，汇总 UMTCV6_REF vs G2 对比行 + 三张图的文件清单，然后停止。**这是收官批，此后实验阶段结束**。
 
 ### 明确不做的
-- 不在这三个数据集上跑 G2/REF 以外的配置（F 系列、X 系列、EMA 等一律不跑）；
-- 不调数据集专属超参（发现某数据集不收敛时如实上报，不许私自调 lr/epoch）；
-- 3 seed 复核不做；数据集图像内容一个字节都不许改。
+- 除 UMTCV6_REF 外不新增任何训练 run；不碰 EMA/X/S 系列；不调任何超参；
+- 数据集目录严格只读；任务 2/3/4 全部为只读推理/读取，不得改动任何 ckpt 与代码（除已授权的 DySample 修复外）。
 
 ### 上报
-- 每个 run 完成后更新看板 + results_log.md；队列跑空后每小时拉取一次本文件等待指令
+- 每个任务完成后更新看板 + results_log.md；全部完成后停止，每小时拉取等待最终收口

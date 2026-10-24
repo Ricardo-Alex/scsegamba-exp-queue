@@ -3,41 +3,59 @@
 > 本文件由客户端 AI 维护，每次巡检看板后更新。
 > **拉取频率：每小时一次。**
 
-**更新时间**：2026-10-23（第 14 次下发，⚠️ 评测协议统一纠偏，最高优先级）
-**状态**：FINAL_CAP_S1 跑完后，立即执行本批纠偏流程
+**更新时间**：2026-10-24（第 15 次下发，消融补齐 + FPS 复测）
+**状态**：统一口径已完成 → 执行 Z 系列补齐消融
 
 ---
 
-## ⚠️ 主人裁决（最高优先级，立即生效）
+## 已定稿（勿动）
 
-**两条线评测协议必须统一，统一标准为 SCSegamba 原版协议**：
-- 逐 epoch 直接在**测试集**上评测，取 50 轮 max mIoU（与老线 M/V6/A 系列口径一致）；
-- 指标用 SCSegamba 原版评测代码的 ODS/OIS/F1（不是 F1@0.5）；
-- v6final 线此前的"val 选模 + test 一次 + F1@0.5"口径作废，仅留档备查。
+- **最终方案 = G2 配置**：K8 旋转蛇形 + DAWF（M_out 逐像素方向加权）+ 无重排 + 无 EMA；统一口径 0.8849/0.8612/0.9164；
+- **评测协议已统一为 SCSegamba 原版**（逐 epoch 测 test 取 max mIoU，ODS/OIS/F1 原版指标）——本批全部 run 必须走统一口径评测（第 14 批改好的评测段）。
 
-**关键事实（执行前必读）**：训练权重与评测协议无关——所有已跑 run 的模型不需要重训，只需用 SCSegamba 口径**回放评测**。
+---
 
-## 纠偏流程（按顺序）
+## 第 15 批：Z 系列——消融矩阵补齐（主人已批准 Z1~Z6 全跑）
 
-### Step 0：checkpoint 盘点（立即，零成本）
-检查 F0/F1/F3/F4/F5/G1/G2/G3/X1~X6/S1/FINAL_CAP_S1 各 run 是否保存了**逐 epoch checkpoint**（而非仅 best-val ckpt），在看板/results_log 公布清单。这决定走 Step 1 还是 Step 2。
+### 代码改动（SAVSS_2D_v6_v4.py，仅一处：打分模式从重排开关解耦）
 
-### Step 1（有逐 epoch ckpt 的 run）：回放评测
-对每个 run 的 50 个 epoch ckpt，用 SCSegamba 原版评测代码逐轮测 **test 集**，登记：max mIoU / best_ep(test) / ODS / OIS / F1 / 后10轮均值。**不改动任何训练产物，只读 ckpt。** 全部结果以新表"统一口径（SCSegamba 协议）"登记在看板，旧口径行保留但标注"作废口径"。
+```python
+# env 区新增：
+ATS_SMODE = os.environ.get('ATS_SMODE', 'full')   # full | crackness | align（仅作用于 DAWF 打分）
+assert ATS_SMODE in ('full', 'crackness', 'align')
 
-### Step 2（无逐 epoch ckpt 的 run）：按优先级补训
-修改 v6final 训练脚本评测段：每 epoch 用 SCSegamba 原版评测直接测 test 集并保存 ckpt。补训优先级：
-1. **S1**（最终方案，必须有）
-2. **F0**（基座锚点）
-3. **G2**（DAWF 关键对照）
-4. X2 / X5 / X6（矩阵代表格）
-5. G1 / G3 / X1 / X3 / X4 / F3 / F4（矩阵其余格，按序补齐）
+# DAWF 分支的 scores 计算处改为：
+def _dawf_score(self, crackness_b, angle_b, theta_k):
+    if ATS_SMODE == 'crackness':
+        return crackness_b
+    if ATS_SMODE == 'align':
+        return torch.abs(torch.cos(angle_b - theta_k))
+    return crackness_b * torch.abs(torch.cos(angle_b - theta_k))
+# scores = torch.stack([self._dawf_score(crackness_b, angle_b, float(self.path_angles[k]))
+#                       for k in range(self.K)], dim=1)
+```
 
-### Step 3：FINAL_CAP_S1 处理
-当前在跑的 FINAL_CAP_S1 让它跑完（数据留档），随后同样走 Step 1/2 出统一口径数字。**不再启动任何新训练，直到统一口径表完成。**
+### 实验矩阵（锚点 = G2 统一口径 0.8849/0.8612；判据照旧：max mIoU > 锚点 且 ODS ≥ 锚点−0.005）
+
+| 顺序 | run | 配置 | 补哪格 |
+|---|---|---|---|
+| 1 | Z1 | ATS_SCAN=rowmajor（K=1）+ ATS_FUSE=alpha + reorder=none | 模块间：单路扫描基座 |
+| 2 | Z2 | G2 配置 + ATS_SMODE=crackness | DAWF 模块内：仅裂缝置信项 |
+| 3 | Z3 | G2 配置 + ATS_SMODE=align | DAWF 模块内：仅方向对齐项 |
+| 4 | Z4 | G2 配置 + ATS_GAMMA=0.25 | ATS 模块内：通道划分比例 |
+| 5 | Z5 | G2 配置 + ATS_GAMMA=0.75 | 同上 |
+| 6 | Z6 | ATS_SCAN=serpentine + ATS_K=4 + ATS_FUSE=dawf + reorder=none | 同几何 K=4 vs K=8 |
+
+执行规则：按序执行（Z1~Z3 优先，是论文必答格）；每个 run 登记统一口径 max mIoU/best_ep/ODS/OIS/F1/后10均/Params/GFLOPs/FPS/β 收敛值；**注意 Z1~Z6 全部为最终方案的消融变体，用统一口径评测段跑（逐 epoch 测 test）**。
+
+### 同批附加任务：FPS 空卡复测
+当前 GPU 空闲时段，对以下配置用 bs=1、512×512、空卡条件统一复测 FPS（各测 3 次取均值）：**G2（最终方案）、F0、F1、S1u、X4u**。结果单独列表登记。
+
+### 完成后
+Z 系列 + FPS 复测全部完成后，更新看板并停止，等客户端收口指令（下一步：整理第三章实验数据包）。
 
 ### 明确不做的
-- 不再用 val-select 口径报任何新数字；数据集图像内容一个字节都不许改。
+- Δ 调制/重排/EMA 不再跑；3 seed 复核不做；数据集图像内容一个字节都不许改。
 
 ### 上报
-- Step 0 盘点结果**立即**上看板（不用等跑完）；每个 run 回放/补训完成即更新；全部完成后等客户端收口指令
+- 每个 run 完成后更新看板 + results_log.md；队列跑空后每小时拉取一次本文件等待指令
